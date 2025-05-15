@@ -39,12 +39,12 @@ def process_chunk_to_llm_input(chunk: List[Dict[str, Any]], image_output_dir: st
             abs_image_output_dir = os.path.abspath(image_output_dir)
             try:
                 if not os.path.isabs(el["content"]):
-                     # Fallback if image path is not absolute, try to make it relative to image_output_dir parent
-                     logger.warning(f"Image path {el['content']} is not absolute. Attempting relative path from parent of {abs_image_output_dir}.")
-                     # This assumes el['content'] is like 'image.png' and should be under abs_image_output_dir
-                     img_file_name = os.path.basename(el["content"])
-                     abs_img_path = os.path.join(abs_image_output_dir, img_file_name)
-                     rel_path = os.path.relpath(abs_img_path, abs_image_output_dir)
+                    # Fallback if image path is not absolute, try to make it relative to image_output_dir parent
+                    logger.warning(f"Image path {el['content']} is not absolute. Attempting relative path from parent of {abs_image_output_dir}.")
+                    # This assumes el['content'] is like 'image.png' and should be under abs_image_output_dir
+                    img_file_name = os.path.basename(el["content"])
+                    abs_img_path = os.path.join(abs_image_output_dir, img_file_name)
+                    rel_path = os.path.relpath(abs_img_path, abs_image_output_dir)
 
                 else:
                     rel_path = os.path.relpath(el["content"], abs_image_output_dir)
@@ -159,9 +159,9 @@ def _process_chunks_in_batches(
                     for i, markdown_content in enumerate(markdown_batch_llm_output):
                         output_storage_idx = current_batch_start_idx + i
                         if output_storage_idx < total_chunks: # Boundary check
-                             final_markdown_outputs[output_storage_idx] = markdown_content
+                            final_markdown_outputs[output_storage_idx] = markdown_content
                         else:
-                             logger.error(f"Index {output_storage_idx} out of bounds for final_markdown_outputs (size {total_chunks})")
+                            logger.error(f"Index {output_storage_idx} out of bounds for final_markdown_outputs (size {total_chunks})")
                     
                     # Update overall processed count and progress bar
                     # pbar.n is the current count in progress bar, pbar.update increases it
@@ -205,10 +205,10 @@ def _process_chunks_in_batches(
                  logger.error(f"Batch {current_batch_start_idx+1}-{current_batch_end_idx} ultimately failed after max API retries.")
                  # Errors are already marked in final_markdown_outputs
                 
-                # Update progress details
-                elapsed_time = pbar.format_dict["elapsed"]
-                current_rate = pbar.n / elapsed_time if elapsed_time > 0 else 0
-                pbar.set_postfix_str(f"{current_rate:.1f} chunks/s")
+            # Update progress details
+            elapsed_time = pbar.format_dict["elapsed"]
+            current_rate = pbar.n / elapsed_time if elapsed_time > 0 else 0
+            pbar.set_postfix_str(f"{current_rate:.1f} chunks/s")
 
             # Save partial markdown and checkpoint after each batch
             _save_partial_markdown(
@@ -224,7 +224,7 @@ def _process_chunks_in_batches(
                 "original_chunked_elements": original_chunked_elements, 
                 "final_markdown_outputs": final_markdown_outputs, 
                 "processed_chunks_count": processed_chunks_count,
-                "total_chunks": total_chunks,
+                "total_chunks": total_chunks
             }
             # Assuming CheckpointManager has a method to save a generic dictionary
             checkpoint_manager.save_checkpoint_data(checkpoint_data_to_save) 
