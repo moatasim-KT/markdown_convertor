@@ -1,66 +1,28 @@
-from typing import List, Dict, Any, Optional
-import os
-import re
-from .math_detector import process_math, detect_math
+from typing import List, Optional
 
-def wrap_math_expressions(text: str) -> str:
-    """
-    Process text to properly format math expressions using the enhanced math detector.
-    
-    Args:
-        text: Input text potentially containing math expressions
-        
-    Returns:
-        str: Text with properly formatted math expressions
-    """
-    return process_math(text)
-
-def assemble_markdown_from_elements(
-    chunked_elements: List[List[Dict[str, Any]]], 
-    image_dir: str
+def assemble_markdown_from_processed_chunks(
+    processed_markdown_chunks: List[Optional[str]],
 ) -> str:
     """
-    Combines element-based chunks into a Markdown string, placing image references inline.
-    Applies math wrapping to text blocks.
+    Combines LLM-processed markdown chunks into a single Markdown string.
+    Assumes each string in the list is a fully processed markdown chunk.
     
     Args:
-        chunked_elements: List of chunks, where each chunk is a list of elements
-        image_dir: Directory where images are stored
+        processed_markdown_chunks: List of strings, where each string is 
+                                   the LLM-processed markdown for a chunk.
+                                   May contain None for unprocessed or failed chunks.
         
     Returns:
-        str: Combined markdown content
+        str: Combined markdown content.
     """
-    md_chunks = []
+    # Filter out any None entries which might represent unprocessed or failed chunks
+    # and ensure all parts are strings.
+    valid_chunks = [
+        chunk.strip() if isinstance(chunk, str) 
+        else "[Error: Chunk not processed]" if chunk is None 
+        else "[Error: Invalid chunk type]"
+        for chunk in processed_markdown_chunks
+    ]
     
-    for chunk in chunked_elements:
-        md_chunk = []
-        
-        for el in chunk:
-            if el["type"] == "text":
-                # Process text with enhanced math detection
-                processed_text = process_math(el["content"])
-                md_chunk.append(processed_text)
-                
-            elif el["type"] == "image":
-                # Handle image references
-                rel_path = os.path.relpath(el["content"], os.path.dirname(image_dir))
-                alt_text = f"Image from page {el.get('page', '')}"
-                
-                # Check if this is likely a math image (based on size and aspect ratio)
-                bbox = el.get("bbox", [0, 0, 100, 20])  # Default small bbox
-                width = bbox[2] - bbox[0] if len(bbox) > 2 else 100
-                height = bbox[3] - bbox[1] if len(bbox) > 3 else 20
-                aspect_ratio = width / height if height > 0 else 1
-                
-                # Heuristic: Math images are often wider than they are tall
-                if aspect_ratio > 2.0 or height < 100:
-                    alt_text = f"Equation image from page {el.get('page', '')}"
-                    
-                md_chunk.append(f"![{alt_text}]({rel_path})")
-        
-        # Join elements within the chunk with double newlines
-        if md_chunk:
-            md_chunks.append("\n\n".join(md_chunk))
-    
-    # Separate chunks with horizontal rules
-    return "\n\n---\n\n".join(md_chunks)
+    # Separate chunks with horizontal rules (or chosen separator)
+    return "\n\n---\n\n".join(valid_chunks)

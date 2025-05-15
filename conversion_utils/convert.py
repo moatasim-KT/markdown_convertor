@@ -10,7 +10,8 @@ from tqdm import tqdm
 from .pdf_parser import extract_elements
 from .chunker import chunk_elements
 from .groq_client import convert_chunks_to_markdown, APIClientError, RateLimitError
-from .markdown_assembler import assemble_markdown_from_elements, wrap_math_expressions
+from .markdown_assembler import assemble_markdown_from_processed_chunks # Updated import
+from .math_detector import process_math # Import process_math directly
 from .checkpoint import CheckpointManager
 
 # Configure logging
@@ -18,267 +19,223 @@ logger = logging.getLogger(__name__)
 
 def setup_output_dirs(output_md_path: str, image_output_dir: str) -> tuple[str, str]:
     """Create necessary output directories and return normalized paths."""
-    # Ensure output directory exists
     output_dir = os.path.dirname(os.path.abspath(output_md_path))
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Create images directory
     os.makedirs(image_output_dir, exist_ok=True)
-    
     return output_md_path, image_output_dir
 
-def process_chunk(chunk: List[Dict[str, Any]], image_output_dir: str) -> str:
-    """Process a single chunk of elements into markdown text."""
-    chunk_text = []
+def process_chunk_to_llm_input(chunk: List[Dict[str, Any]], image_output_dir: str) -> str:
+    """
+    Process a single chunk of elements into a single string suitable for LLM input.
+    Text elements are processed with math detection and wrapping.
+    Image elements are converted to placeholders.
+    """
+    chunk_text_parts = []
     for el in chunk:
         if el["type"] == "text":
-            chunk_text.append(wrap_math_expressions(el["content"]))
+            # Apply math processing (cleaning + wrapping) before sending to LLM
+            chunk_text_parts.append(process_math(el["content"]))
         elif el["type"] == "image":
-            rel_path = os.path.relpath(el["content"], os.path.dirname(image_output_dir))
-            chunk_text.append(f"[IMAGE: {rel_path}]")
-    return "\n\n".join(chunk_text)
+            abs_image_output_dir = os.path.abspath(image_output_dir)
+            try:
+                if not os.path.isabs(el["content"]):
+                     # Fallback if image path is not absolute, try to make it relative to image_output_dir parent
+                     logger.warning(f"Image path {el['content']} is not absolute. Attempting relative path from parent of {abs_image_output_dir}.")
+                     # This assumes el['content'] is like 'image.png' and should be under abs_image_output_dir
+                     img_file_name = os.path.basename(el["content"])
+                     abs_img_path = os.path.join(abs_image_output_dir, img_file_name)
+                     rel_path = os.path.relpath(abs_img_path, abs_image_output_dir)
+
+                else:
+                    rel_path = os.path.relpath(el["content"], abs_image_output_dir)
+            except ValueError: 
+                # This can happen if paths are on different drives (Windows) or other issues
+                logger.warning(f"Could not create relative path for {el['content']} against {abs_image_output_dir}. Using basename.")
+                rel_path = os.path.basename(el["content"]) 
+            chunk_text_parts.append(f"[IMAGE: {rel_path}]") # LLM is prompted to handle this
+    return "\n\n".join(chunk_text_parts)
 
 def _save_partial_markdown(
     output_path: str,
-    chunked_elements: List[List[Dict[str, Any]]],
-    image_output_dir: str,
-    processed_chunks: int
+    processed_markdown_list: List[Optional[str]], # Takes list of processed strings
+    processed_chunks_count: int # Number of chunks in the list that are considered processed
 ) -> None:
-    """Save the current state of processed chunks to the output file.
-    
-    Args:
-        output_path: Path to the output Markdown file
-        chunked_elements: All chunk elements (both processed and unprocessed)
-        image_output_dir: Directory for extracted images
-        processed_chunks: Number of chunks that have been processed so far
-    """
+    """Save the current state of processed markdown chunks to the output file."""
     try:
-        # Only include processed chunks in the output
-        processed_chunks_list = chunked_elements[:processed_chunks]
+        # Include only the processed chunks up to processed_chunks_count
+        # assemble_markdown_from_processed_chunks will filter Nones and handle error placeholders
+        chunks_to_save = processed_markdown_list[:processed_chunks_count]
         
-        # Generate markdown for processed elements
-        markdown = assemble_markdown_from_elements(processed_chunks_list, image_output_dir)
+        markdown = assemble_markdown_from_processed_chunks(chunks_to_save)
         
-        # Create output directory if it doesn't exist
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         
-        # Write to a temporary file first
         temp_path = f"{output_path}.tmp"
         with open(temp_path, 'w', encoding='utf-8') as f:
             f.write(markdown)
         
-        # Atomically replace the output file
         if os.path.exists(output_path):
             os.remove(output_path)
         os.rename(temp_path, output_path)
         
-        logger.debug(f"Saved partial markdown with {processed_chunks} chunks to {output_path}")
+        # Use length of chunks_to_save as it reflects what was actually passed to assembler
+        logger.debug(f"Saved partial markdown with {len(chunks_to_save)} fully processed or error-marked chunks to {output_path}")
     except Exception as e:
         logger.warning(f"Failed to save partial markdown: {str(e)}", exc_info=True)
-        # Don't raise, as we want to continue processing even if saving fails
 
 def _process_chunks_in_batches(
-    chunk_texts: List[str],
-    chunked_elements: List[List[Dict[str, Any]]],
-    image_output_dir: str,
+    llm_input_texts: List[str], 
+    final_markdown_outputs: List[Optional[str]], 
+    original_chunked_elements: List[List[Dict[str, Any]]], 
+    image_output_dir: str, 
     checkpoint_manager: CheckpointManager,
     output_md_path: str,
     batch_size: int = 5,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    start_chunk: int = 0,
+    start_chunk_idx: int = 0, 
+    pdf_path_for_checkpoint: str = "",
     **conversion_kwargs
-) -> None:
-    """Process chunks in batches with checkpointing and error handling.
-    
-    Args:
-        chunk_texts: List of chunk texts to process
-        chunked_elements: Original chunk elements to update with processed markdown
-        image_output_dir: Directory for extracted images
-        checkpoint_manager: Checkpoint manager instance
-        output_md_path: Path to save the output Markdown file
-        batch_size: Number of chunks to process in each batch
-        progress_callback: Optional callback for progress updates
-        start_chunk: Chunk index to start processing from (for resuming)
-        **conversion_kwargs: Additional arguments for convert_chunks_to_markdown
-    
-    Raises:
-        RuntimeError: If processing fails and cannot be recovered
+) -> int:
     """
-    # Validate inputs
-    if not chunk_texts or not chunked_elements:
-        logger.warning("No chunks to process")
-        return
+    Process text chunks in batches, sends them to LLM, and stores the output in final_markdown_outputs.
+    Returns the total count of chunks that have been processed (attempted or successful).
+    """
+    if not llm_input_texts:
+        logger.warning("No LLM input texts to process.")
+        return 0
         
-    if len(chunk_texts) != len(chunked_elements):
-        raise ValueError("Mismatch between chunk_texts and chunked_elements lengths")
-        
-    total_chunks = len(chunk_texts)
-    processed_chunks = start_chunk
+    total_chunks = len(llm_input_texts)
+    # This count reflects how many entries in final_markdown_outputs are filled (attempted/succeeded)
+    processed_chunks_count = start_chunk_idx 
     
     # Filter only the arguments that convert_chunks_to_markdown accepts
     allowed_args = {
         'max_retries', 'backoff_factor', 'timeout', 'parallel', 'max_workers'
     }
-    convert_kwargs = {
+    llm_convert_kwargs = {
         k: v for k, v in conversion_kwargs.items() if k in allowed_args
     }
-    """Process chunks in batches with checkpointing.
     
-    Args:
-        chunk_texts: List of chunk texts to process
-        chunked_elements: Original chunk elements to update with processed markdown
-        image_output_dir: Directory for extracted images
-        checkpoint_manager: Checkpoint manager instance
-        batch_size: Number of chunks to process in each batch
-        **conversion_kwargs: Additional arguments for convert_chunks_to_markdown
-    """
-    total_chunks = len(chunk_texts)
-    processed_chunks = 0
-    
-    # Create progress bar
+    # tqdm progress bar setup
     with tqdm(
+        initial=processed_chunks_count, # Start progress from where we left off
         total=total_chunks,
         desc="Converting",
         unit="chunk",
         ncols=100,
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
     ) as pbar:
-        # Initialize retry counter
-        consecutive_failures = 0
-        max_consecutive_failures = 3
-        
-        try:
-            # Process chunks in batches
-            for i in range(0, total_chunks, batch_size):
-                batch_start = i
-                batch_end = min(i + batch_size, total_chunks)
-                
-                # Update progress bar description with batch info
-                pbar.set_description(f"Batch {i//batch_size + 1}/{(total_chunks + batch_size - 1)//batch_size}")
-                
-                # Log detailed batch info
-                logger.info(
-                    f"Processing batch {i//batch_size + 1}/{(total_chunks + batch_size - 1)//batch_size} "
-                    f"(chunks {batch_start+1}-{batch_end} of {total_chunks})"
-                )
-                
+        max_api_failures_per_batch = 3 # Max retries for a batch failing due to API issues
+
+        # Iterate from the start_chunk_idx, effectively skipping already processed chunks if resuming
+        for current_batch_start_idx in range(start_chunk_idx, total_chunks, batch_size):
+            current_batch_end_idx = min(current_batch_start_idx + batch_size, total_chunks)
+            
+            # Slice the llm_input_texts for the current batch
+            batch_llm_inputs_to_process = llm_input_texts[current_batch_start_idx:current_batch_end_idx]
+            
+            if not batch_llm_inputs_to_process: # Should not happen with correct loop logic
+                continue
+
+            pbar.set_description(
+                f"Batch {(current_batch_start_idx // batch_size) + 1}/{(total_chunks + batch_size - 1) // batch_size}"
+            )
+            logger.info(
+                f"Processing batch {(current_batch_start_idx // batch_size) + 1} "
+                f"(chunks {current_batch_start_idx + 1}-{current_batch_end_idx} of {total_chunks})"
+            )
+
+            api_batch_attempt = 0
+            batch_processed_successfully = False
+            while api_batch_attempt < max_api_failures_per_batch:
                 try:
-                    # Process the current batch
-                    markdown_batch = convert_chunks_to_markdown(
-                        chunks=chunk_texts[batch_start:batch_end],
-                        **convert_kwargs
+                    # Call LLM for the current batch
+                    markdown_batch_llm_output = convert_chunks_to_markdown(
+                        chunks=batch_llm_inputs_to_process,
+                        **llm_convert_kwargs 
                     )
-                    consecutive_failures = 0  # Reset counter on success
                     
+                    # Store results in the main list
+                    for i, markdown_content in enumerate(markdown_batch_llm_output):
+                        output_storage_idx = current_batch_start_idx + i
+                        if output_storage_idx < total_chunks: # Boundary check
+                             final_markdown_outputs[output_storage_idx] = markdown_content
+                        else:
+                             logger.error(f"Index {output_storage_idx} out of bounds for final_markdown_outputs (size {total_chunks})")
+                    
+                    # Update overall processed count and progress bar
+                    # pbar.n is the current count in progress bar, pbar.update increases it
+                    # We want to update by the number of items processed in this successful batch
+                    num_processed_in_batch = len(batch_llm_inputs_to_process)
+                    pbar.update(num_processed_in_batch)
+                    processed_chunks_count = current_batch_end_idx # Update to the end of the current batch
+                    batch_processed_successfully = True
+                    break # Exit retry loop for this batch
+
                 except (RateLimitError, APIClientError) as e:
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        logger.error(f"Too many consecutive failures ({consecutive_failures}): {str(e)}")
-                        logger.info("Checkpoint saved. You can resume the conversion later.")
-                        raise
-                        
-                    # Exponential backoff
-                    backoff_time = (2 ** (consecutive_failures - 1)) * 5  # 5, 10, 20, ... seconds
+                    api_batch_attempt += 1
                     logger.warning(
-                        f"API error (attempt {consecutive_failures}/{max_consecutive_failures}). "
-                        f"Retrying in {backoff_time} seconds..."
+                        f"API error on batch {current_batch_start_idx+1}-{current_batch_end_idx} (Attempt {api_batch_attempt}/{max_api_failures_per_batch}): {str(e)}"
                     )
-                    time.sleep(backoff_time)
-                    continue  # Retry the same batch
+                    if api_batch_attempt >= max_api_failures_per_batch:
+                        logger.error(
+                            f"Max API retries for batch {current_batch_start_idx+1}-{current_batch_end_idx} reached. Marking items as errored."
+                        )
+                        for i in range(len(batch_llm_inputs_to_process)):
+                            final_markdown_outputs[current_batch_start_idx + i] = f"[Error: API processing failed for this chunk - {str(e)}]"
+                        pbar.update(len(batch_llm_inputs_to_process)) # Still update progress
+                        processed_chunks_count = current_batch_end_idx 
+                        break # Exit retry loop for this batch
                     
-                except Exception as e:
-                    logger.error(f"Unexpected error processing batch: {str(e)}", exc_info=True)
-                    # Mark this chunk as failed but continue with the next one
-                    markdown_batch = ["[Error: Failed to process chunk]"] * (batch_end - batch_start)
-                    # Still update the elements to include the error message
+                    backoff_duration = (2 ** (api_batch_attempt -1)) * 5 
+                    logger.info(f"Retrying current batch in {backoff_duration} seconds...")
+                    time.sleep(backoff_duration)
                 
-                # Update chunked_elements with processed markdown
-                for j, (chunk, markdown) in enumerate(zip(
-                    chunked_elements[batch_start:batch_end], 
-                    markdown_batch
-                )):
-                    # Update the first text element in each chunk with the processed markdown
-                    for el in chunk:
-                        if el["type"] == "text":
-                            el["content"] = markdown
-                            break
-                
-                # Update progress
-                processed_chunks = batch_end
-                chunks_processed = processed_chunks - pbar.n
-                
-                # Update progress bar
-                pbar.update(chunks_processed)
+                except Exception as e: # Catch other unexpected errors during batch LLM processing
+                    logger.error(f"Unexpected critical error processing batch {current_batch_start_idx+1}-{current_batch_end_idx}: {str(e)}", exc_info=True)
+                    for i in range(len(batch_llm_inputs_to_process)):
+                        final_markdown_outputs[current_batch_start_idx + i] = f"[Error: Unexpected critical error during processing - {str(e)}]"
+                    pbar.update(len(batch_llm_inputs_to_process))
+                    processed_chunks_count = current_batch_end_idx
+                    # This is a more severe error, re-raise to stop all processing.
+                    raise RuntimeError(f"Fatal error processing batch: {str(e)}") from e
+            
+            # After each batch is processed (or failed max retries)
+            if not batch_processed_successfully and api_batch_attempt >= max_api_failures_per_batch:
+                 logger.error(f"Batch {current_batch_start_idx+1}-{current_batch_end_idx} ultimately failed after max API retries.")
+                 # Errors are already marked in final_markdown_outputs
                 
                 # Update progress details
                 elapsed_time = pbar.format_dict["elapsed"]
-                rate = pbar.n / elapsed_time if elapsed_time > 0 else 0
-                pbar.set_postfix({
-                    'rate': f"{rate:.1f} chunks/s",
-                })
-                
-                # Save the processed chunks to the output file
-                try:
-                    _save_partial_markdown(
-                        output_path=output_md_path,
-                        chunked_elements=chunked_elements,
-                        image_output_dir=image_output_dir,
-                        processed_chunks=processed_chunks
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to update output file: {str(e)}")
-                
-                # Save checkpoint after each successful batch
-                try:
-                    checkpoint = checkpoint_manager.create_checkpoint(
-                        pdf_path=conversion_kwargs.get('pdf_path', output_md_path + '.pdf'),
-                        output_md_path=output_md_path,
-                        image_output_dir=image_output_dir,
-                        chunks=chunked_elements,
-                        processed_chunks=processed_chunks,
-                        total_chunks=total_chunks,
-                        completed=(processed_chunks >= total_chunks)
-                    )
-                    
-                    # Save partial markdown to output file
-                    _save_partial_markdown(
-                        output_path=output_md_path,
-                        chunked_elements=chunked_elements,
-                        image_output_dir=image_output_dir,
-                        processed_chunks=processed_chunks
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Error saving checkpoint: {e}", exc_info=True)
-                    # Continue processing even if checkpoint fails
-                    if processed_chunks >= total_chunks:
-                        break  # Exit if we've processed all chunks
-                
-                checkpoint_manager.save_checkpoint(checkpoint)
-                
-                # Update progress callback if provided
-                if progress_callback:
-                    progress_callback(processed_chunks, total_chunks)
-                
-                logger.debug(f"Completed {processed_chunks}/{total_chunks} chunks")
-                
-        except Exception as e:
-            logger.critical(f"Fatal error in batch processing: {str(e)}", exc_info=True)
-            logger.info("Checkpoint saved. You can resume the conversion later.")
-            # Try to save one last checkpoint before exiting
-            try:
-                checkpoint_manager.create_checkpoint(
-                    pdf_path=conversion_kwargs.get('pdf_path', output_md_path + '.pdf'),
-                    output_md_path=output_md_path,
-                    image_output_dir=image_output_dir,
-                    chunks=chunked_elements,
-                    processed_chunks=processed_chunks,
-                    total_chunks=total_chunks,
-                    completed=False
-                )
-            except Exception as save_error:
-                logger.error(f"Failed to save final checkpoint: {save_error}", exc_info=True)
-                raise RuntimeError(f"Failed to process batch {batch_start}-{batch_end}: {str(e)}") from e
+                current_rate = pbar.n / elapsed_time if elapsed_time > 0 else 0
+                pbar.set_postfix_str(f"{current_rate:.1f} chunks/s")
+
+            # Save partial markdown and checkpoint after each batch
+            _save_partial_markdown(
+                output_path=output_md_path,
+                processed_markdown_list=final_markdown_outputs,
+                processed_chunks_count=processed_chunks_count 
+            )
+            
+            checkpoint_data_to_save = {
+                "pdf_path": pdf_path_for_checkpoint, # Save the original PDF path
+                "output_md_path": output_md_path,
+                "image_output_dir": image_output_dir,
+                "original_chunked_elements": original_chunked_elements, 
+                "final_markdown_outputs": final_markdown_outputs, 
+                "processed_chunks_count": processed_chunks_count,
+                "total_chunks": total_chunks,
+            }
+            # Assuming CheckpointManager has a method to save a generic dictionary
+            checkpoint_manager.save_checkpoint_data(checkpoint_data_to_save) 
+            
+            if progress_callback:
+                progress_callback(processed_chunks_count, total_chunks)
+            
+            logger.debug(f"End of batch. Processed count: {processed_chunks_count}/{total_chunks} chunks.")
+
+    return processed_chunks_count # Return the total number of chunks processed/attempted
+
 
 def convert_pdf_to_markdown(
     pdf_path: str, 
@@ -290,10 +247,11 @@ def convert_pdf_to_markdown(
     parallel: bool = False,
     max_workers: Optional[int] = None,
     resume: bool = True,
-    batch_size: int = 5
+    batch_size: int = 5,
+    settings: Optional[Dict[str, Any]] = None 
 ) -> None:
     """
-    Convert a PDF file to Markdown with inline images using Groq API.
+    Convert a PDF file to Markdown, processing content through an LLM.
     
     Args:
         pdf_path: Path to the input PDF file
@@ -306,128 +264,179 @@ def convert_pdf_to_markdown(
         max_workers: Maximum number of parallel workers (if parallel=True)
         resume: Whether to resume from previous checkpoint if available
         batch_size: Number of chunks to process in each batch
++        settings: Optional dictionary for future configuration.
         
     Raises:
-        FileNotFoundError: If the input PDF does not exist
-        ValueError: If no content is found in the PDF
-        APIClientError: For API-related errors
-        Exception: For other unexpected errors
+        FileNotFoundError: If the input PDF is not found.
+        ValueError: If input PDF is invalid or no content is found.
+        APIClientError: For unrecoverable API-related errors.
+        Exception: For other unexpected errors during processing.
     """
     start_time = datetime.now()
     logger.info(f"Starting PDF to Markdown conversion for: {pdf_path}")
-    
-    # Initialize checkpoint manager
-    checkpoint_manager = CheckpointManager(output_md_path)
-    
-    # Check for existing checkpoint if resuming is enabled
+
+    if not os.path.isfile(pdf_path):
+        raise FileNotFoundError(f"Input PDF file not found: {pdf_path}")
+
+    output_md_path, image_output_dir = setup_output_dirs(output_md_path, image_output_dir)
+    # Checkpoint file path is derived from output_md_path
+    checkpoint_manager = CheckpointManager(output_md_path) 
+
+    original_chunked_elements: List[List[Dict[str, Any]]]
+    final_markdown_outputs: List[Optional[str]]
+    llm_input_texts: List[str]
+    processed_chunks_count = 0
     total_chunks = 0
-    processed_chunks = 0
-    if resume:
-        can_resume, checkpoint, message = checkpoint_manager.is_resumable(pdf_path)
-        if can_resume and checkpoint:
-            logger.info(f"Resuming from previous checkpoint: {message}")
-            # Use the checkpoint data
-            all_chunks = checkpoint.chunks
-            processed_chunks = checkpoint.metadata["processed_chunks"]
-            total_chunks = checkpoint.metadata["total_chunks"]
-            
-            logger.info(f"Resuming from chunk {processed_chunks + 1} of {total_chunks}")
-            
-            # Use all chunks for processing, but track where to start
-            chunked_elements = all_chunks
-        else:
-            logger.info(f"Starting new conversion: {message}")
-            chunked_elements = None
-    else:
-        logger.info("Starting new conversion (resume disabled)")
-        chunked_elements = None
     
-    try:
-        # Validate input
-        if not os.path.isfile(pdf_path):
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    loaded_checkpoint_data = None
+    if resume:
+        # Assuming CheckpointManager.load_checkpoint_data() returns the dict or None
+        loaded_checkpoint_data = checkpoint_manager.load_checkpoint_data() 
+
+    if loaded_checkpoint_data and loaded_checkpoint_data.get("pdf_path") == pdf_path:
+        logger.info(f"Resuming from checkpoint for {pdf_path}")
+        original_chunked_elements = loaded_checkpoint_data["original_chunked_elements"]
+        final_markdown_outputs = loaded_checkpoint_data["final_markdown_outputs"]
+        processed_chunks_count = loaded_checkpoint_data["processed_chunks_count"]
+        total_chunks = loaded_checkpoint_data["total_chunks"]
         
-        # Setup output directories
-        output_md_path, image_output_dir = setup_output_dirs(output_md_path, image_output_dir)
+        # Ensure final_markdown_outputs has the correct length if checkpoint was saved mid-batch
+        # or if the checkpoint format was from an older version.
+        if len(final_markdown_outputs) != total_chunks:
+            logger.warning(
+                f"Checkpoint data for final_markdown_outputs has length {len(final_markdown_outputs)}, "
+                f"but total_chunks is {total_chunks}. Re-initializing and attempting to copy."
+            )
+            correct_size_outputs = [None] * total_chunks
+            for i in range(min(len(final_markdown_outputs), total_chunks)):
+                correct_size_outputs[i] = final_markdown_outputs[i]
+            final_markdown_outputs = correct_size_outputs
+            # Adjust processed_chunks_count if it's now out of bounds due to array resizing
+            processed_chunks_count = min(processed_chunks_count, sum(1 for x in final_markdown_outputs if x is not None))
+
+
+        llm_input_texts = [process_chunk_to_llm_input(chunk, image_output_dir) for chunk in original_chunked_elements]
         
-        # If we're not resuming, extract and chunk elements
-        if not chunked_elements:
-            # 1. Extract elements (text blocks and images)
-            logger.info("Extracting elements from PDF...")
-            elements = extract_elements(pdf_path, image_output_dir)
-            if not elements:
-                raise ValueError("No text or images found in the PDF.")
-            logger.info(f"Extracted {len(elements)} elements from PDF")
+        # Check if already completed
+        if processed_chunks_count >= total_chunks and all(final_markdown_outputs[i] is not None for i in range(total_chunks)):
+            logger.info("Conversion was already completed according to checkpoint.")
+        else:
+             # If not fully complete, log where we are resuming from
+             logger.info(f"Resuming from chunk {processed_chunks_count + 1} of {total_chunks}")
+
+    else: # Conditions for starting a new conversion
+        if resume and loaded_checkpoint_data: 
+            logger.warning(f"Checkpoint found for a different PDF ('{loaded_checkpoint_data.get('pdf_path')}') or resume data incomplete. Starting new conversion for '{pdf_path}'.")
+        else: 
+            logger.info("Starting new conversion (no valid checkpoint found or resume disabled).")
+
+        logger.info("Extracting elements from PDF...")
+        elements = extract_elements(pdf_path, image_output_dir)
+        if not elements:
+            raise ValueError("No text or images found in the PDF.")
+        logger.info(f"Extracted {len(elements)} elements.")
+
+        logger.info("Chunking elements...")
+        original_chunked_elements = chunk_elements(elements)
+        if not original_chunked_elements:
+            raise ValueError("Failed to chunk PDF content.")
+        total_chunks = len(original_chunked_elements)
+        logger.info(f"Created {total_chunks} chunks for processing.")
+
+        llm_input_texts = [process_chunk_to_llm_input(chunk, image_output_dir) for chunk in original_chunked_elements]
+        final_markdown_outputs = [None] * total_chunks # Initialize with Nones
+        processed_chunks_count = 0 # Start from the beginning
+
+    # Core processing loop if not already completed
+    if processed_chunks_count < total_chunks or not all(final_markdown_outputs[i] is not None for i in range(total_chunks)):
+        logger.info("Processing chunks through LLM...")
+        try:
+            processed_chunks_count = _process_chunks_in_batches(
+                llm_input_texts=llm_input_texts,
+                final_markdown_outputs=final_markdown_outputs, # Pass this list to be populated
+                original_chunked_elements=original_chunked_elements, # For checkpointing
+                image_output_dir=image_output_dir, # For checkpointing
+                checkpoint_manager=checkpoint_manager,
+                output_md_path=output_md_path,
+                batch_size=batch_size,
+                progress_callback=lambda current, total: None, # Placeholder, can be expanded
+                start_chunk_idx=processed_chunks_count, # Where to start processing
+                pdf_path_for_checkpoint=pdf_path, 
+                # Pass through relevant conversion arguments
+                max_retries=max_retries,       
+                backoff_factor=backoff_factor,
+                timeout=timeout,
+                parallel=parallel,
+                max_workers=max_workers
+            )
+        except RuntimeError as e: 
+            logger.error(f"Critical error during batch processing: {e}. Conversion halted.")
+            # Checkpoint should have been saved by _process_chunks_in_batches
+            raise # Re-raise the error to stop execution and indicate failure
             
-            # 2. Chunk elements
-            logger.info("Chunking elements...")
-            chunked_elements = chunk_elements(elements)
-            if not chunked_elements:
-                raise ValueError("Failed to chunk PDF content.")
-            logger.info(f"Created {len(chunked_elements)} chunks for processing")
-        
-        # 3. Process chunks to Markdown in batches
-        logger.info("Converting chunks to Markdown...")
-        
-        # Convert chunks to text first
-        chunk_texts = [process_chunk(chunk, image_output_dir) for chunk in chunked_elements]
-        total_chunks = len(chunk_texts)
-        
-        # Process chunks in batches with checkpointing and incremental saving
-        _process_chunks_in_batches(
-            chunk_texts=chunk_texts,
-            chunked_elements=chunked_elements,
-            image_output_dir=image_output_dir,
-            checkpoint_manager=checkpoint_manager,
-            output_md_path=output_md_path,
-            batch_size=batch_size,
-            pdf_path=pdf_path,
-            max_retries=max_retries,
-            backoff_factor=backoff_factor,
-            timeout=timeout,
-            parallel=parallel,
-            max_workers=max_workers,
-            progress_callback=lambda current, total: None,  # No-op callback for now
-            start_chunk=processed_chunks
-        )
-        
-        # The final markdown is already saved by _process_chunks_in_batches
-        # We just need to ensure the last version is complete and properly formatted
-        logger.info("Finalizing Markdown...")
-        markdown = assemble_markdown_from_elements(chunked_elements, image_output_dir)
-        with open(output_md_path, 'w', encoding='utf-8') as f:
-            f.write(markdown)
-        
-        # Mark conversion as complete in the checkpoint
-        checkpoint = checkpoint_manager.create_checkpoint(
-            pdf_path=pdf_path,
-            output_md_path=output_md_path,
-            image_output_dir=image_output_dir,
-            chunks=chunked_elements,
-            processed_chunks=total_chunks,
-            total_chunks=total_chunks,
-            completed=True
-        )
-        checkpoint_manager.save_checkpoint(checkpoint)
-        
-        # Clean up checkpoint on successful completion
-        checkpoint_manager.cleanup()
+    logger.info("Assembling final Markdown document...")
+    # Ensure all items in final_markdown_outputs are strings for assembly
+    # If any are None at this stage, it means they were skipped or failed critically
+    # The assembler already handles None by inserting an error placeholder.
             
-        elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Successfully converted PDF to Markdown in {elapsed:.2f} seconds")
-        logger.info(f"Markdown saved to: {output_md_path}")
-        logger.info(f"Images saved to: {image_output_dir}")
-            
-    except (RateLimitError, APIClientError) as e:
-        logger.error(f"API error during conversion: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Error during PDF to Markdown conversion: {str(e)}")
-        # Clean up partially created files on error
-        if os.path.exists(output_md_path):
-            try:
-                os.remove(output_md_path)
-                logger.warning(f"Removed incomplete output file: {output_md_path}")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to clean up output file: {cleanup_error}")
-        raise
+    final_markdown = assemble_markdown_from_processed_chunks(final_markdown_outputs)
+    
+    with open(output_md_path, 'w', encoding='utf-8') as f:
+        f.write(final_markdown)
+
+    logger.info("Finalizing checkpoint as complete.")
+    final_checkpoint_data = {
+        "pdf_path": pdf_path,
+        "output_md_path": output_md_path,
+        "image_output_dir": image_output_dir,
+        "original_chunked_elements": original_chunked_elements,
+        "final_markdown_outputs": final_markdown_outputs,
+        "processed_chunks_count": total_chunks, # Mark all as processed
+        "total_chunks": total_chunks,
+        # "completed": True # This can be inferred if processed_chunks_count == total_chunks
+    }
+    checkpoint_manager.save_checkpoint_data(final_checkpoint_data)
+    checkpoint_manager.cleanup() # Remove checkpoint file on successful completion
+
+    elapsed_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Successfully converted PDF to Markdown in {elapsed_time:.2f} seconds.")
+    logger.info(f"Output Markdown saved to: {output_md_path}")
+    logger.info(f"Images saved to: {image_output_dir}")
+
+# Example usage (if this file were to be run directly)
+if __name__ == '__main__':
+    # This is a placeholder for potential command-line integration or testing
+    # For actual use, import and call convert_pdf_to_markdown from another script
+    
+    # Configure basic logging for testing
+    logging.basicConfig(
+        level=logging.INFO, # Use INFO or DEBUG for more verbosity during testing
+        format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s'
+    )
+    
+    # Replace with actual paths for testing
+    # test_pdf_path = "path/to/your/test.pdf"  # <--- SET YOUR TEST PDF PATH HERE
+    # test_md_output = "path/to/your/output.md" # <--- SET YOUR TEST MD OUTPUT PATH HERE
+    # test_image_dir = "path/to/your/images"    # <--- SET YOUR TEST IMAGE DIR HERE
+    
+    # # Ensure the test PDF exists before trying to convert
+    # if test_pdf_path != "path/to/your/test.pdf" and os.path.exists(test_pdf_path):
+    #     logger.info(f"--- Starting test conversion for {test_pdf_path} ---")
+    #     try:
+    #         convert_pdf_to_markdown(
+    #             pdf_path=test_pdf_path,
+    #             output_md_path=test_md_output,
+    #             image_output_dir=test_image_dir,
+    #             resume=True, 
+    #             batch_size=2, # Small batch size for testing
+    #             parallel=False # Easier to debug sequentially first
+    #         )
+    #         logger.info(f"--- Test conversion finished for {test_pdf_path} ---")
+    #     except Exception as e:
+    #         logger.error(f"Test conversion failed: {e}", exc_info=True)
+    # else:
+    #     if test_pdf_path == "path/to/your/test.pdf":
+    #         logger.warning("Test PDF path not set. Skipping example run.")
+    #     else:
+    #         logger.warning(f"Test PDF not found at {test_pdf_path}, skipping example run.")
+    pass
