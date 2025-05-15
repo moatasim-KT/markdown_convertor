@@ -18,7 +18,9 @@ def assemble_markdown_from_processed_chunks(
     # Filter out any None entries which might represent unprocessed or failed chunks
     # and ensure all parts are strings.
     valid_chunks = [
-        str(chunk).strip() if chunk is not None else "[Error: Chunk not processed]" 
+        chunk.strip() if isinstance(chunk, str) 
+        else "[Error: Chunk not processed]" if chunk is None 
+        else "[Error: Invalid chunk type]"
         for chunk in processed_markdown_chunks
     ]
     
