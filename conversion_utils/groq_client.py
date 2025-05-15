@@ -61,28 +61,30 @@ HEADERS = {
     "User-Agent": "PDF-to-Markdown-Converter/1.0"
 }
 
-# Double all curly braces in the prompt to escape them
+# LLM_PROMPT definition
+# Note: Literal curly braces in LaTeX examples (e.g., for environments) are escaped with a single backslash: \{ \}
+# The {{text}} placeholder is for the actual input data, which is handled by .format_map()
 LLM_PROMPT = (
-    "Convert the following text and images to well-formatted Markdown. Follow these guidelines:\n\n"
+    "Convert the following text and images to well-formatted Markdown. Follow these guidelines meticulously:\n\n"
     "1. For mathematical expressions:\n"
-    "   - Inline math: Wrap in $...$ like $E = mc^2$\n"
-    "   - Display math: Wrap in $$...$$ on separate lines\n"
-    "   - Preserve LaTeX environments like \\\\begin{{align}}...\\\\end{{align}}\n"
-    "   - Don't convert LaTeX to plain text\n\n"
+    "   - Inline math: Wrap in $...$ (e.g., $E = mc^2$).\n"
+    "   - Display math: Wrap in $$...$$ on separate lines (e.g., $$x = \\frac\{-b \\pm \\sqrt\{b^2-4ac\}\}\{2a\}$$).\n"
+    "   - LaTeX Environments: The input may contain text pre-formatted with LaTeX delimiters (e.g., $...$, $$...$$, \\(...\\), \\[...\\]) or LaTeX environments (e.g., \\begin\{align\}...\\end\{align\}, \\begin\{equation\}...\\end\{equation\}). Transcribe these LaTeX segments *exactly* as provided into the final Markdown. Do not attempt to re-interpret or convert them to plain text. Ensure correct escaping for Markdown where necessary.\n"
+    "   - Do not convert any LaTeX to plain text or re-render it. Preserve it.\n\n"
     "2. For images:\n"
-    "   - If it's an equation, transcribe it to LaTeX\n"
-    "   - For other images, use ![description](path)\n\n"
-    "3. Preserve:\n"
-    "   - Headings (#, ##, etc.)\n"
-    "   - Lists (bulleted and numbered)\n"
-    "   - Tables\n"
-    "   - Code blocks\n"
-    "   - Blockquotes\n\n"
-    "4. Formatting:\n"
-    "   - Use proper Markdown syntax\n"
-    "   - Ensure consistent spacing\n"
-    "   - Preserve original meaning and structure\n\n"
-    "Input:\n{{text}}\n\n"
+    "   - If an image clearly represents an equation, transcribe it into the appropriate LaTeX math format (inline or display).\n"
+    "   - For other images (charts, diagrams, photos), use the Markdown syntax: ![description](path_to_image.ext). Provide a concise, relevant description.\n\n"
+    "3. Content and Structure Preservation:\n"
+    "   - Preserve headings (using #, ##, etc.), lists (bulleted using -, *, or +; numbered using 1., 2., etc.), tables (using Markdown table syntax), code blocks (using triple backticks ```language ... ```), and blockquotes (using >).\n"
+    "   - Maintain the original meaning, logical flow, and paragraph structure of the text.\n\n"
+    "4. Formatting and Cleanliness:\n"
+    "   - Use proper Markdown syntax throughout.\n"
+    "   - Ensure consistent spacing and avoid excessive blank lines.\n"
+    "   - Input Text Quality: The input text is extracted from a PDF and may occasionally contain minor OCR artifacts (e.g., misspellings, strange characters, misplaced spaces). Produce clean, well-structured Markdown, correcting obvious OCR errors when confident it improves readability and accuracy without altering meaning. If a word or phrase is unclear, transcribe it as best as possible.\n"
+    "   - Repetition Handling: Critically examine the input text for any repeated words or phrases that seem erroneous. Ensure that such repetitions, if they appear to be transcription errors from the source, are corrected or removed in the output. Do not introduce new repetitions.\n\n"
+    "5. Output Requirements:\n"
+    "   - Generate only the Markdown content. Do not include any introductory phrases, explanations, or summaries before or after the Markdown output.\n\n"
+    "Input Text (potentially with OCR imperfections and pre-formatted LaTeX):\n{{text}}\n\n"
     "Output Markdown:"
 )
 
@@ -237,18 +239,19 @@ def convert_chunk_to_markdown(
             "model": MODEL,
             "messages": [
                 {
-                    "role": "system", 
-                    "content": "You are a helpful assistant that converts documents to Markdown with correct LaTeX for math. Do not include any introductory or explanatory text - just return the converted markdown content."
+                    "role": "system",
+                    "content": "You are a highly accurate assistant specializing in converting documents to clean, well-formatted Markdown with precise LaTeX for math. Your goal is to produce the most accurate and error-free Markdown representation of the input, correcting minor OCR imperfections where appropriate. Do not include any introductory or explanatory text - just return the converted markdown content."
                 },
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.1,  # Lower temperature for more consistent results
+            "temperature": 0.05,  # Lowered temperature for more deterministic and accurate output
             "max_tokens": 4000,  # Adjust based on expected output size
+            "top_p": 0.9, # Added top_p for nucleus sampling, can make output less random
         }
         
         # Log the size of the chunk being processed
         chunk_size = len(chunk.encode('utf-8')) / 1024  # Size in KB
-        logger.info(f"Processing {chunk_info}({chunk_size:.1f} KB)")
+        logger.info(f"Processing {chunk_info}({chunk_size:.1f} KB), Prompt length: {len(prompt)} chars")
     except Exception as e:
         error_msg = f"Error preparing request for {chunk_info}: {str(e)}"
         logger.error(error_msg, exc_info=True)
