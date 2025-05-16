@@ -544,23 +544,26 @@ def convert_chunks_to_markdown(
     max_workers: Optional[int] = None
 ) -> List[str]:
     """
-    Converts a list of text chunks to Markdown using Groq API.
+    Convert chunks of text to markdown using Groq API.
     
     Args:
         chunks: List of text chunks to convert
-        max_retries: Maximum number of retry attempts per chunk
-        backoff_factor: Base multiplier for exponential backoff
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Backoff factor for exponential backoff
         timeout: Request timeout in seconds
         parallel: Whether to process chunks in parallel
         max_workers: Maximum number of worker threads for parallel processing
-        
+    
     Returns:
-        List[str]: List of converted Markdown chunks with assistant messages removed
-        
-    Note:
-        When parallel=True, the max_workers parameter controls the number of concurrent
-        API requests. Be mindful of API rate limits when increasing this value.
+        List of markdown content for each chunk
+    
+    Raises:
+        APIClientError: For unrecoverable API-related errors
+        RateLimitError: For rate limit errors
+        Exception: For other unexpected errors
     """
+    logger.info(f"Starting to convert {len(chunks)} chunks using Groq API")
+    
     if not chunks:
         logger.warning("No chunks provided for processing")
         return []

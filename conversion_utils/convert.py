@@ -358,6 +358,7 @@ def convert_pdf_to_markdown(
     # Core processing loop if not already completed
     if processed_chunks_count < total_chunks or not all(final_markdown_outputs[i] is not None for i in range(total_chunks)):
         logger.info("Processing chunks through LLM...")
+        logger.info(f"Starting batch processing with {len(llm_input_texts)} chunks")
         try:
             processed_chunks_count = _process_chunks_in_batches(
                 llm_input_texts=llm_input_texts,
@@ -377,6 +378,7 @@ def convert_pdf_to_markdown(
                 parallel=parallel,
                 max_workers=max_workers
             )
+            logger.info(f"Completed processing {processed_chunks_count} chunks")
         except RuntimeError as e: 
             logger.error(f"Critical error during batch processing: {e}. Conversion halted.")
             # Checkpoint should have been saved by _process_chunks_in_batches
