@@ -41,6 +41,37 @@ class CustomRetry(Retry):
             return min(wait_time, MAX_RETRY_DELAY)
         return super().get_backoff_time()
 
+    def sleep(self, response=None): # 'response' here is the response that caused the retry
+        # This method is called by urllib3 before it sleeps.
+        backoff_time = self.get_backoff_time() # This already considers _rate_limit_reset
+
+        status_code = response.status if response else None
+        reason_msg = f"due to status {status_code}" if status_code else "for a general retry"
+
+        # Check if the sleep is primarily due to a pending rate limit reset
+        # self._rate_limit_reset is a timestamp for when the rate limit should be clear
+        # get_backoff_time() already returns max(0, self._rate_limit_reset - time.time())
+        # if self._rate_limit_reset is set and in the future.
+        
+        # So, backoff_time correctly reflects the necessary sleep,
+        # whether it's from exponential backoff or a Retry-After header / rate_limit_reset.
+
+        if backoff_time > 0:
+            # Determine if this backoff is specifically because of a known rate limit reset time
+            # We can infer this if _rate_limit_reset is set and significantly contributes to backoff_time
+            # A small tolerance (e.g., 1 second) can be used if comparing backoff_time to (_rate_limit_reset - now)
+            now = time.time()
+            is_rate_limit_wait = (self._rate_limit_reset > now and 
+                                  abs(backoff_time - (self._rate_limit_reset - now)) < 1.0)
+
+            if is_rate_limit_wait:
+                logger.info(f"Rate limit active or Retry-After received. Sleeping for {backoff_time:.2f} seconds.")
+            else:
+                logger.info(f"Retry attempt: Sleeping for {backoff_time:.2f} seconds {reason_msg}.")
+        
+        # Call the original sleep method from urllib3.Retry to actually perform the sleep
+        super().sleep(response)
+
 # Configure session with custom retry strategy and connection pooling
 session = requests.Session()
 retry_strategy = CustomRetry(
@@ -300,150 +331,6 @@ def convert_chunk_to_markdown(
         error_msg = f"Error preparing request for {chunk_info}: {str(e)}"
         logger.error(error_msg, exc_info=True)
         raise APIClientError(error_msg) from e
-    
-    last_exception = None
-    
-    for attempt in range(max_retries + 1):
-        wait_time = _exponential_backoff_with_jitter(attempt)
-        
-        try:
-            if attempt > 0:
-                logger.warning(
-                    f"Attempt {attempt + 1}/{max_retries} for {chunk_info}after waiting {wait_time:.2f}s. "
-                    f"Sending request to Groq API..."
-                )
-                time.sleep(wait_time)
-            else:
-                logger.info(f"Sending initial request for {chunk_info}to Groq API...")
-            
-            # Make the API request with a timeout
-            start_time = time.time()
-            logger.debug(f"Sending request to {GROQ_API_URL} with timeout={timeout}s")
-            
-            try:
-                logger.info(f"Sending request to {GROQ_API_URL} with timeout={timeout}s...")
-                start_time = time.time()
-                try:
-                    # Use a connection timeout and read timeout
-                    response = session.post(
-                        GROQ_API_URL,
-                        headers=HEADERS,
-                        json=data,
-                        timeout=(5, timeout)  # 5s connection timeout, timeout read timeout
-                    )
-                    response.raise_for_status()  # Raise for HTTP errors
-                except requests.exceptions.Timeout:
-                    logger.error(f"Request timed out after {timeout}s")
-                    raise
-                except requests.exceptions.ConnectionError:
-                    logger.error("Connection error occurred")
-                    raise
-                except requests.exceptions.HTTPError as e:
-                    logger.error(f"HTTP error occurred: {e.response.status_code}")
-                    raise
-                except Exception as e:
-                    logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-                    raise
-                response_time = time.time() - start_time
-                logger.info(f"API request completed in {response_time:.2f}s with status {response.status_code}")
-            except requests.exceptions.Timeout:
-                logger.error(f"Request timed out after {timeout}s")
-                raise
-            except requests.exceptions.ConnectionError:
-                logger.error("Connection error occurred")
-                raise
-            except Exception as e:
-                logger.error(f"Request failed: {str(e)}", exc_info=True)
-                raise
-                
-            request_duration = time.time() - start_time
-            
-            # Log request details
-            logger.debug(
-                f"API request completed in {request_duration:.2f}s with status {response.status_code}"
-            )
-            
-            # Check for rate limiting
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', wait_time * 2))
-                retry_after = min(retry_after, MAX_RETRY_DELAY)
-                
-                logger.warning(
-                    f"Rate limited on {chunk_info}(attempt {attempt + 1}/{max_retries}). "
-                    f"Retrying after {retry_after}s..."
-                )
-                
-                # Update rate limit reset time
-                reset_time = int(time.time()) + retry_after
-                if hasattr(session.adapters['https://'], 'max_retries'):
-                    session.adapters['https://'].max_retries._rate_limit_reset = reset_time
-                
-                time.sleep(retry_after)
-                continue
-                
-            # Check for other errors
-            response.raise_for_status()
-            
-            # Process successful response
-            try:
-                result = response.json()
-                logger.debug(f"API response: {json.dumps(result, indent=2)[:500]}...")  # Log first 500 chars
-                
-                if "choices" not in result or not result["choices"]:
-                    error_msg = "Invalid response format from API - no choices in response"
-                    logger.error(f"{chunk_info}{error_msg}")
-                    raise APIClientError(error_msg)
-                
-                # Clean up the response before returning
-                raw_content = result["choices"][0]["message"]["content"]
-                if not raw_content or not raw_content.strip():
-                    error_msg = "Empty response from API"
-                    logger.error(f"{chunk_info}{error_msg}")
-                    raise APIClientError(error_msg)
-                    
-                cleaned_content = _clean_markdown_response(raw_content)
-                logger.info(f"Successfully processed {chunk_info}in {request_duration:.2f}s")
-                return cleaned_content
-                
-            except (KeyError, IndexError, json.JSONDecodeError) as e:
-                error_msg = f"Error parsing API response: {str(e)}"
-                logger.error(f"{chunk_info}{error_msg}", exc_info=True)
-                raise APIClientError(error_msg) from e
-            
-        except requests.exceptions.HTTPError as e:
-            last_exception = e
-            if isinstance(e.response, requests.Response):
-                try:
-                    _handle_api_error(e.response)
-                except RateLimitError as rle:
-                    logger.warning(f"Rate limited on {chunk_info}: {str(rle)}")
-                    if attempt == max_retries - 1:  # Last attempt
-                        logger.error(f"Max retries ({max_retries}) exceeded for {chunk_info}")
-                        raise
-                    continue
-                    
-            if attempt == max_retries - 1:  # Last attempt
-                logger.error(f"Max retries ({max_retries}) exceeded for {chunk_info}")
-                break
-                
-        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            last_exception = e
-            logger.error(f"Request error on attempt {attempt + 1}/{max_retries} for {chunk_info}: {str(e)}", 
-                        exc_info=logger.isEnabledFor(logging.DEBUG))
-            
-            if attempt == max_retries - 1:  # Last attempt
-                logger.error(f"Max retries ({max_retries}) exceeded for {chunk_info}")
-                break
-            
-            # Add a small delay before retrying on network errors
-            time.sleep(1 + random.random())
-    
-    # If we get here, all retries failed
-    error_msg = f"Failed after {max_retries} attempts for {chunk_info}"
-    if last_exception:
-        error_msg += f": {str(last_exception)}"
-    logger.error(error_msg)
-    raise APIClientError(error_msg) from last_exception
 
 def _process_chunks_in_parallel(
     chunks: List[str],
