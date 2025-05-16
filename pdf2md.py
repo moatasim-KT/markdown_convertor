@@ -12,6 +12,8 @@ import sys
 from typing import Optional
 
 from conversion_utils.convert import convert_pdf_to_markdown
+from conversion_utils.groq_client import APIClientError, RateLimitError
+from conversion_utils.checkpoint import CheckpointManager
 
 # Configure logging
 logging.basicConfig(
@@ -51,13 +53,6 @@ def parse_arguments():
     
     # Checkpointing options
     checkpoint_group = parser.add_argument_group('checkpointing options')
-    checkpoint_group.add_argument(
-        "--no-resume",
-        action="store_false",
-        dest="resume",
-        default=True,
-        help="Disable resuming from previous checkpoint"
-    )
     checkpoint_group.add_argument(
         "--batch-size",
         type=int,
@@ -162,26 +157,38 @@ def main():
     try:
         logger.info(f"Starting conversion of {args.pdf} to {args.output}")
         
-        convert_pdf_to_markdown(
-            pdf_path=args.pdf,
-            output_md_path=args.output,
-            image_output_dir=args.images,
-            max_retries=args.max_retries,
-            backoff_factor=args.backoff_factor,
-            timeout=args.timeout,
-            parallel=args.parallel,
-            max_workers=args.max_workers,
-            resume=args.resume,
-            batch_size=args.batch_size
-        )
+        # Initialize checkpoint manager with output file path
+        checkpoint_manager = CheckpointManager(output_md_path=args.output)
+        
+        try:
+            convert_pdf_to_markdown(
+                pdf_path=args.pdf,
+                output_md_path=args.output,
+                image_output_dir=args.images,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                backoff_factor=args.backoff_factor,
+                timeout=args.timeout,
+                parallel=args.parallel,
+                max_workers=args.max_workers,
+                checkpoint_manager=checkpoint_manager
+            )
+        except APIClientError as e:
+            logger.error(f"API client error: {str(e)}")
+            sys.exit(1)
+        except RateLimitError as e:
+            logger.error(f"Rate limit error: {str(e)}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"An unexpected error occurred: {str(e)}")
+            sys.exit(1)
         
         logger.info("Conversion completed successfully!")
         
     except KeyboardInterrupt:
         logger.warning("\nConversion interrupted by user.")
         sys.exit(130)  # Standard exit code for Ctrl+C
-    except Exception as e:
-        logger.exception("An unexpected error occurred during conversion.")
+        logger.exception("An unexpected error  occurred during conversion.")
         sys.exit(1)
 
 if __name__ == "__main__":

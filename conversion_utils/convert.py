@@ -217,17 +217,15 @@ def _process_chunks_in_batches(
                 processed_chunks_count=processed_chunks_count 
             )
             
-            checkpoint_data_to_save = {
-                "pdf_path": pdf_path_for_checkpoint, # Save the original PDF path
-                "output_md_path": output_md_path,
-                "image_output_dir": image_output_dir,
-                "original_chunked_elements": original_chunked_elements, 
-                "final_markdown_outputs": final_markdown_outputs, 
-                "processed_chunks_count": processed_chunks_count,
-                "total_chunks": total_chunks
-            }
-            # Assuming CheckpointManager has a method to save a generic dictionary
-            checkpoint_manager.save_checkpoint_data(checkpoint_data_to_save) 
+            # Create checkpoint using the CheckpointManager's create_checkpoint method
+            checkpoint_manager.create_checkpoint(
+                pdf_path=pdf_path_for_checkpoint,
+                output_md_path=output_md_path,
+                image_output_dir=image_output_dir,
+                chunks=original_chunked_elements,
+                processed_chunks=processed_chunks_count,
+                total_chunks=total_chunks
+            )
             
             if progress_callback:
                 progress_callback(processed_chunks_count, total_chunks)
@@ -241,15 +239,16 @@ def convert_pdf_to_markdown(
     pdf_path: str, 
     output_md_path: str, 
     image_output_dir: str,
-    max_retries: int = 5,
-    backoff_factor: float = 2.0,
-    timeout: int = 30,
-    parallel: bool = False,
+    batch_size: int = 10,
+    max_retries: int = 10,
+    backoff_factor: float = 1.5,
+    timeout: int = 60,
+    parallel: bool = True,
     max_workers: Optional[int] = None,
-    resume: bool = True,
-    batch_size: int = 5,
-    settings: Optional[Dict[str, Any]] = None 
-) -> None:
+    checkpoint_manager: Optional[CheckpointManager] = None,
+    checkpoint_interval: int = 100,
+    progress_callback: Optional[Callable[[int, int], None]] = None
+) -> str:
     """
     Convert a PDF file to Markdown, processing content through an LLM.
     
@@ -257,14 +256,15 @@ def convert_pdf_to_markdown(
         pdf_path: Path to the input PDF file
         output_md_path: Path to save the output Markdown file
         image_output_dir: Directory to save extracted images
+        batch_size: Number of chunks to process in each batch
         max_retries: Maximum number of retry attempts for API calls
         backoff_factor: Base multiplier for exponential backoff between retries
         timeout: Request timeout in seconds
         parallel: Whether to process chunks in parallel
         max_workers: Maximum number of parallel workers (if parallel=True)
-        resume: Whether to resume from previous checkpoint if available
-        batch_size: Number of chunks to process in each batch
-+        settings: Optional dictionary for future configuration.
+        checkpoint_manager: Optional checkpoint manager for resuming
+        checkpoint_interval: Number of chunks between checkpoints
+        progress_callback: Optional callback for progress updates
         
     Raises:
         FileNotFoundError: If the input PDF is not found.
@@ -279,8 +279,8 @@ def convert_pdf_to_markdown(
         raise FileNotFoundError(f"Input PDF file not found: {pdf_path}")
 
     output_md_path, image_output_dir = setup_output_dirs(output_md_path, image_output_dir)
-    # Checkpoint file path is derived from output_md_path
-    checkpoint_manager = CheckpointManager(output_md_path) 
+    # Initialize checkpoint manager with output_md_path
+    checkpoint_manager = CheckpointManager(output_md_path=output_md_path) 
 
     original_chunked_elements: List[List[Dict[str, Any]]]
     final_markdown_outputs: List[Optional[str]]
@@ -289,11 +289,19 @@ def convert_pdf_to_markdown(
     total_chunks = 0
     
     loaded_checkpoint_data = None
-    if resume:
-        # Assuming CheckpointManager.load_checkpoint_data() returns the dict or None
-        loaded_checkpoint_data = checkpoint_manager.load_checkpoint_data() 
+    checkpoint = checkpoint_manager.load_checkpoint(pdf_path)
+    if checkpoint:
+        loaded_checkpoint_data = {
+            "pdf_path": pdf_path,
+            "original_chunked_elements": checkpoint.chunks,
+            "final_markdown_outputs": [None] * len(checkpoint.chunks),  # Initialize with None
+            "processed_chunks_count": checkpoint.metadata.processed_chunks,
+            "total_chunks": checkpoint.metadata.total_chunks
+        }
+    else:
+        loaded_checkpoint_data = None
 
-    if loaded_checkpoint_data and loaded_checkpoint_data.get("pdf_path") == pdf_path:
+    if loaded_checkpoint_data and loaded_checkpoint_data["pdf_path"] == pdf_path:
         logger.info(f"Resuming from checkpoint for {pdf_path}")
         original_chunked_elements = loaded_checkpoint_data["original_chunked_elements"]
         final_markdown_outputs = loaded_checkpoint_data["final_markdown_outputs"]
@@ -325,10 +333,10 @@ def convert_pdf_to_markdown(
              logger.info(f"Resuming from chunk {processed_chunks_count + 1} of {total_chunks}")
 
     else: # Conditions for starting a new conversion
-        if resume and loaded_checkpoint_data: 
-            logger.warning(f"Checkpoint found for a different PDF ('{loaded_checkpoint_data.get('pdf_path')}') or resume data incomplete. Starting new conversion for '{pdf_path}'.")
-        else: 
-            logger.info("Starting new conversion (no valid checkpoint found or resume disabled).")
+        if loaded_checkpoint_data:
+            logger.info(f"Resuming conversion from checkpoint for {pdf_path}")
+        else:
+            logger.info("Starting new conversion")
 
         logger.info("Extracting elements from PDF...")
         elements = extract_elements(pdf_path, image_output_dir)

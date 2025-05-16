@@ -16,7 +16,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL = "mixtral-8x7b-32768"  # Updated to a more reliable model
 DEFAULT_MAX_RETRIES = 10  # Increased from 5 to 10
@@ -24,6 +23,9 @@ DEFAULT_BACKOFF_FACTOR = 1.5  # Reduced from 2.0 for more frequent retries
 DEFAULT_TIMEOUT = 60  # Increased from 30 seconds
 MAX_RETRY_DELAY = 300  # 5 minutes maximum delay between retries
 RATE_LIMIT_WINDOW = 60  # 1 minute window for rate limiting
+
+# Constants
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Configure session with custom retry strategy
 class CustomRetry(Retry):
@@ -39,19 +41,21 @@ class CustomRetry(Retry):
             return min(wait_time, MAX_RETRY_DELAY)
         return super().get_backoff_time()
 
-# Configure session with custom retry strategy
+# Configure session with custom retry strategy and connection pooling
 session = requests.Session()
 retry_strategy = CustomRetry(
     total=DEFAULT_MAX_RETRIES,
     backoff_factor=DEFAULT_BACKOFF_FACTOR,
-    status_forcelist=[429, 500, 502, 503, 504, 522, 524],
+    status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["POST"],
-    respect_retry_after_header=True
+    respect_retry_after_header=True,
+    raise_on_status=False  # Don't raise immediately on failed status
 )
 adapter = HTTPAdapter(
     max_retries=retry_strategy,
-    pool_connections=10,
-    pool_maxsize=10
+    pool_connections=10,  # Number of connections to save
+    pool_maxsize=10,     # Max number of connections to save
+    pool_block=True      # Block when no connections are available
 )
 session.mount("https://", adapter)
 
@@ -64,29 +68,37 @@ HEADERS = {
 # LLM_PROMPT definition
 # Note: Literal curly braces in LaTeX examples (e.g., for environments) are escaped with a single backslash: \{ \}
 # The {{text}} placeholder is for the actual input data, which is handled by .format_map()
-LLM_PROMPT = (
-    "Convert the following text and images to well-formatted Markdown. Follow these guidelines meticulously:\n\n"
-    "1. For mathematical expressions:\n"
-    "   - Inline math: Wrap in $...$ (e.g., $E = mc^2$).\n"
-    "   - Display math: Wrap in $$...$$ on separate lines (e.g., $$x = \\frac\{-b \\pm \\sqrt\{b^2-4ac\}\}\{2a\}$$).\n"
-    "   - LaTeX Environments: The input may contain text pre-formatted with LaTeX delimiters (e.g., $...$, $$...$$, \\(...\\), \\[...\\]) or LaTeX environments (e.g., \\begin\{align\}...\\end\{align\}, \\begin\{equation\}...\\end\{equation\}). Transcribe these LaTeX segments *exactly* as provided into the final Markdown. Do not attempt to re-interpret or convert them to plain text. Ensure correct escaping for Markdown where necessary.\n"
-    "   - Do not convert any LaTeX to plain text or re-render it. Preserve it.\n\n"
-    "2. For images:\n"
-    "   - If an image clearly represents an equation, transcribe it into the appropriate LaTeX math format (inline or display).\n"
-    "   - For other images (charts, diagrams, photos), use the Markdown syntax: ![description](path_to_image.ext). Provide a concise, relevant description.\n\n"
-    "3. Content and Structure Preservation:\n"
-    "   - Preserve headings (using #, ##, etc.), lists (bulleted using -, *, or +; numbered using 1., 2., etc.), tables (using Markdown table syntax), code blocks (using triple backticks ```language ... ```), and blockquotes (using >).\n"
-    "   - Maintain the original meaning, logical flow, and paragraph structure of the text.\n\n"
-    "4. Formatting and Cleanliness:\n"
-    "   - Use proper Markdown syntax throughout.\n"
-    "   - Ensure consistent spacing and avoid excessive blank lines.\n"
-    "   - Input Text Quality: The input text is extracted from a PDF and may occasionally contain minor OCR artifacts (e.g., misspellings, strange characters, misplaced spaces). Produce clean, well-structured Markdown, correcting obvious OCR errors when confident it improves readability and accuracy without altering meaning. If a word or phrase is unclear, transcribe it as best as possible.\n"
-    "   - Repetition Handling: Critically examine the input text for any repeated words or phrases that seem erroneous. Ensure that such repetitions, if they appear to be transcription errors from the source, are corrected or removed in the output. Do not introduce new repetitions.\n\n"
-    "5. Output Requirements:\n"
-    "   - Generate only the Markdown content. Do not include any introductory phrases, explanations, or summaries before or after the Markdown output.\n\n"
-    "Input Text (potentially with OCR imperfections and pre-formatted LaTeX):\n{{text}}\n\n"
-    "Output Markdown:"
-)
+LLM_PROMPT = r"""
+Convert the following text and images to well-formatted Markdown. Follow these guidelines meticulously:
+
+1. For mathematical expressions:
+   - Inline math: Wrap in $...$ (e.g., $E = mc^2$).
+   - Display math: Wrap in $$...$$ on separate lines (e.g., $$x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}$$).
+   - LaTeX Environments: The input may contain text pre-formatted with LaTeX delimiters (e.g., $...$, $$...$$, \(...\), \[...\]) or LaTeX environments (e.g., \begin{align}...\end{align}, \begin{equation}...\end{equation}). Transcribe these LaTeX segments *exactly* as provided into the final Markdown. Do not attempt to re-interpret or convert them to plain text. Ensure correct escaping for Markdown where necessary.
+   - Do not convert any LaTeX to plain text or re-render it. Preserve it.
+
+2. For images:
+   - If an image clearly represents an equation, transcribe it into the appropriate LaTeX math format (inline or display).
+   - For other images (charts, diagrams, photos), use the Markdown syntax: ![description](path_to_image.ext). Provide a concise, relevant description.
+
+3. Content and Structure Preservation:
+   - Preserve headings (using #, ##, etc.), lists (bulleted using -, *, or +; numbered using 1., 2., etc.), tables (using Markdown table syntax), code blocks (using triple backticks ```language ... ```), and blockquotes (using >).
+   - Maintain the original meaning, logical flow, and paragraph structure of the text.
+
+4. Formatting and Cleanliness:
+   - Use proper Markdown syntax throughout.
+   - Ensure consistent spacing and avoid excessive blank lines.
+   - Input Text Quality: The input text is extracted from a PDF and may occasionally contain minor OCR artifacts (e.g., misspellings, strange characters, misplaced spaces). Produce clean, well-structured Markdown, correcting obvious OCR errors when confident it improves readability and accuracy without altering meaning. If a word or phrase is unclear, transcribe it as best as possible.
+   - Repetition Handling: Critically examine the input text for any repeated words or phrases that seem erroneous. Ensure that such repetitions, if they appear to be transcription errors from the source, are corrected or removed in the output. Do not introduce new repetitions.
+
+5. Output Requirements:
+   - Generate only the Markdown content. Do not include any introductory phrases, explanations, or summaries before or after the Markdown output.
+
+Input Text (potentially with OCR imperfections and pre-formatted LaTeX):
+{{text}}
+
+Output Markdown:
+"""
 
 class RateLimitError(Exception):
     """Custom exception for rate limit errors"""
@@ -235,29 +247,59 @@ def convert_chunk_to_markdown(
         # Using format_map with a custom dict to prevent any further formatting
         prompt = LLM_PROMPT.format_map({'text': escaped_chunk})
         
-        data = {
-            "model": MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a highly accurate assistant specializing in converting documents to clean, well-formatted Markdown with precise LaTeX for math. Your goal is to produce the most accurate and error-free Markdown representation of the input, correcting minor OCR imperfections where appropriate. Do not include any introductory or explanatory text - just return the converted markdown content."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.05,  # Lowered temperature for more deterministic and accurate output
-            "max_tokens": 4000,  # Adjust based on expected output size
-            "top_p": 0.9, # Added top_p for nucleus sampling, can make output less random
-        }
-        
         # Log the size of the chunk being processed
         chunk_size = len(chunk.encode('utf-8')) / 1024  # Size in KB
         logger.info(f"Processing {chunk_info}({chunk_size:.1f} KB), Prompt length: {len(prompt)} chars")
+        
+        try:
+            # Make the API request with a timeout
+            response = session.post(
+                GROQ_API_URL,
+                headers=HEADERS,
+                json={
+                    "model": MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a highly accurate assistant specializing in converting documents to clean, well-formatted Markdown with precise LaTeX for math. Your goal is to produce the most accurate and error-free Markdown representation of the input, correcting minor OCR imperfections where appropriate. Do not include any introductory or explanatory text - just return the converted markdown content."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.05,
+                    "max_tokens": 4000,
+                    "top_p": 0.9
+                },
+                timeout=(5, timeout)  # 5s connection timeout, timeout read timeout
+            )
+            response.raise_for_status()
+            
+            # Process successful response
+            response_data = response.json()
+            if not response_data.get('choices'):
+                error_msg = "Invalid response format from API - no choices in response"
+                logger.error(f"{chunk_info}{error_msg}")
+                raise APIClientError(error_msg)
+            
+            # Clean up the response before returning
+            raw_content = response_data['choices'][0]['message']['content']
+            if not raw_content or not raw_content.strip():
+                error_msg = "Empty response from API"
+                logger.error(f"{chunk_info}{error_msg}")
+                raise APIClientError(error_msg)
+                
+            cleaned_content = _clean_markdown_response(raw_content)
+            logger.info(f"Successfully processed {chunk_info}in {response_data['usage']['completion_tokens']} tokens")
+            return cleaned_content
+        
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Request error: {str(e)}"
+            logger.error(f"{chunk_info}{error_msg}", exc_info=logger.isEnabledFor(logging.DEBUG))
+            raise APIClientError(error_msg) from e
+        
     except Exception as e:
         error_msg = f"Error preparing request for {chunk_info}: {str(e)}"
         logger.error(error_msg, exc_info=True)
         raise APIClientError(error_msg) from e
-    
-    last_exception = None
     
     last_exception = None
     
@@ -279,12 +321,37 @@ def convert_chunk_to_markdown(
             logger.debug(f"Sending request to {GROQ_API_URL} with timeout={timeout}s")
             
             try:
-                response = session.post(
-                    GROQ_API_URL,
-                    headers=HEADERS,
-                    json=data,
-                    timeout=timeout
-                )
+                logger.info(f"Sending request to {GROQ_API_URL} with timeout={timeout}s...")
+                start_time = time.time()
+                try:
+                    # Use a connection timeout and read timeout
+                    response = session.post(
+                        GROQ_API_URL,
+                        headers=HEADERS,
+                        json=data,
+                        timeout=(5, timeout)  # 5s connection timeout, timeout read timeout
+                    )
+                    response.raise_for_status()  # Raise for HTTP errors
+                except requests.exceptions.Timeout:
+                    logger.error(f"Request timed out after {timeout}s")
+                    raise
+                except requests.exceptions.ConnectionError:
+                    logger.error("Connection error occurred")
+                    raise
+                except requests.exceptions.HTTPError as e:
+                    logger.error(f"HTTP error occurred: {e.response.status_code}")
+                    raise
+                except Exception as e:
+                    logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+                    raise
+                response_time = time.time() - start_time
+                logger.info(f"API request completed in {response_time:.2f}s with status {response.status_code}")
+            except requests.exceptions.Timeout:
+                logger.error(f"Request timed out after {timeout}s")
+                raise
+            except requests.exceptions.ConnectionError:
+                logger.error("Connection error occurred")
+                raise
             except Exception as e:
                 logger.error(f"Request failed: {str(e)}", exc_info=True)
                 raise
